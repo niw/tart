@@ -284,6 +284,10 @@ struct Run: AsyncParsableCommand {
   #endif
   var captureSystemKeys: Bool = false
 
+  @Flag(help: ArgumentHelp("Keep the VM running when its window is closed",
+                           discussion: "Click the Dock icon to show the window again, and quit the app to stop the VM."))
+  var keepRunningOnClose: Bool = false
+
   #if arch(arm64)
     @Flag(help: ArgumentHelp("Don't add trackpad as a pointing device on macOS VMs"))
   #endif
@@ -343,6 +347,10 @@ struct Run: AsyncParsableCommand {
 
     if (noGraphics || vnc || vncExperimental) && captureSystemKeys {
       throw ValidationError("--captures-system-keys can only be used with the default VM view")
+    }
+
+    if (noGraphics || ((vnc || vncExperimental) && !graphics)) && keepRunningOnClose {
+      throw ValidationError("--keep-running-on-close can only be used with the VM window")
     }
 
     if nested {
@@ -663,7 +671,7 @@ struct Run: AsyncParsableCommand {
 
       NSApplication.shared.run()
     } else {
-      runUI(suspendable, captureSystemKeys)
+      runUI(suspendable, captureSystemKeys, keepRunningOnClose)
     }
   }
 
@@ -813,9 +821,10 @@ struct Run: AsyncParsableCommand {
     #endif
   }
 
-  private func runUI(_ suspendable: Bool, _ captureSystemKeys: Bool) {
+  private func runUI(_ suspendable: Bool, _ captureSystemKeys: Bool, _ keepRunningOnClose: Bool) {
     MainApp.suspendable = suspendable
     MainApp.capturesSystemKeys = captureSystemKeys
+    MainApp.keepsRunningOnClose = keepRunningOnClose
     MainApp.main()
   }
 }
@@ -828,15 +837,23 @@ extension Run: MainThreadCommand {}
 struct MainApp: App {
   static var suspendable: Bool = false
   static var capturesSystemKeys: Bool = false
+  static var keepsRunningOnClose: Bool = false
+  static let windowID = "vm"
+  static var openWindow: OpenWindowAction?
 
   @NSApplicationDelegateAdaptor private var appDelegate: AppDelegate
 
   var body: some Scene {
-    WindowGroup(vm!.name) {
+    WindowGroup(vm!.name, id: MainApp.windowID) {
       Group {
         VMView(vm: vm!, capturesSystemKeys: MainApp.capturesSystemKeys).onAppear {
           NSWindow.allowsAutomaticWindowTabbing = false
         }.onDisappear {
+          // Keep the VM running, the window can be shown again from the Dock
+          if MainApp.keepsRunningOnClose {
+            return
+          }
+
           let ret = kill(getpid(), MainApp.suspendable ? SIGUSR1 : SIGINT)
           if ret != 0 {
             // Fallback to the old termination method that doesn't
@@ -852,7 +869,7 @@ struct MainApp: App {
         minHeight: CGFloat(vm!.config.display.height),
         idealHeight: CGFloat(vm!.config.display.height),
         maxHeight: .infinity
-      )
+      ).modifier(OpenWindowActionCapture())
     }.commands {
       // Remove some standard menu options
       CommandGroup(replacing: .help, addition: {})
@@ -892,11 +909,31 @@ class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
     nsApp.activate(ignoringOtherApps: true)
   }
 
+  func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+    // SwiftUI doesn't reliably reopen the closed window, so open it explicitly
+    if MainApp.keepsRunningOnClose && !flag, let openWindow = MainApp.openWindow {
+      openWindow(id: MainApp.windowID)
+      return false
+    }
+
+    return true
+  }
+
   func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
     if (kill(getpid(), MainApp.suspendable ? SIGUSR1 : SIGINT) == 0) {
       return .terminateLater
     } else {
       return .terminateNow
+    }
+  }
+}
+
+struct OpenWindowActionCapture: ViewModifier {
+  @Environment(\.openWindow) private var openWindow
+
+  func body(content: Content) -> some View {
+    content.onAppear {
+      MainApp.openWindow = openWindow
     }
   }
 }
