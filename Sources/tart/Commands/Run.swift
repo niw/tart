@@ -288,6 +288,10 @@ struct Run: AsyncParsableCommand {
                            discussion: "Click the Dock icon to show the window again, and quit the app to stop the VM."))
   var keepRunningOnClose: Bool = false
 
+  @Flag(help: ArgumentHelp("Don't show the VM window until the Dock icon is clicked",
+                           discussion: "Implies --keep-running-on-close."))
+  var noWindow: Bool = false
+
   #if arch(arm64)
     @Flag(help: ArgumentHelp("Don't add trackpad as a pointing device on macOS VMs"))
   #endif
@@ -351,6 +355,10 @@ struct Run: AsyncParsableCommand {
 
     if (noGraphics || ((vnc || vncExperimental) && !graphics)) && keepRunningOnClose {
       throw ValidationError("--keep-running-on-close can only be used with the VM window")
+    }
+
+    if (noGraphics || ((vnc || vncExperimental) && !graphics)) && noWindow {
+      throw ValidationError("--no-window can only be used with the VM window")
     }
 
     if nested {
@@ -671,7 +679,7 @@ struct Run: AsyncParsableCommand {
 
       NSApplication.shared.run()
     } else {
-      runUI(suspendable, captureSystemKeys, keepRunningOnClose)
+      runUI(suspendable, captureSystemKeys, keepRunningOnClose || noWindow, noWindow)
     }
   }
 
@@ -821,10 +829,11 @@ struct Run: AsyncParsableCommand {
     #endif
   }
 
-  private func runUI(_ suspendable: Bool, _ captureSystemKeys: Bool, _ keepRunningOnClose: Bool) {
+  private func runUI(_ suspendable: Bool, _ captureSystemKeys: Bool, _ keepRunningOnClose: Bool, _ noWindow: Bool) {
     MainApp.suspendable = suspendable
     MainApp.capturesSystemKeys = captureSystemKeys
     MainApp.keepsRunningOnClose = keepRunningOnClose
+    MainApp.startsWithoutWindow = noWindow
     MainApp.main()
   }
 }
@@ -838,6 +847,7 @@ struct MainApp: App {
   static var suspendable: Bool = false
   static var capturesSystemKeys: Bool = false
   static var keepsRunningOnClose: Bool = false
+  static var startsWithoutWindow: Bool = false
   static let windowID = "vm"
   static var openWindow: OpenWindowAction?
 
@@ -903,15 +913,36 @@ struct MainApp: App {
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate, ObservableObject {
+  private var hiddenWindows: [NSWindow] = []
+
   func applicationDidFinishLaunching(_ : Notification) {
     let nsApp = NSApplication.shared
     nsApp.setActivationPolicy(.regular)
+
+    // The window is created but not shown yet, hide it until the Dock icon is clicked
+    if MainApp.startsWithoutWindow {
+      hiddenWindows = nsApp.windows.filter { $0.canBecomeMain }
+      hiddenWindows.forEach { $0.orderOut(nil) }
+      return
+    }
+
     nsApp.activate(ignoringOtherApps: true)
   }
 
   func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+    guard MainApp.keepsRunningOnClose && !flag else {
+      return true
+    }
+
+    // Show the window hidden by --no-window
+    if !hiddenWindows.isEmpty {
+      hiddenWindows.forEach { $0.makeKeyAndOrderFront(nil) }
+      hiddenWindows = []
+      return false
+    }
+
     // SwiftUI doesn't reliably reopen the closed window, so open it explicitly
-    if MainApp.keepsRunningOnClose && !flag, let openWindow = MainApp.openWindow {
+    if let openWindow = MainApp.openWindow {
       openWindow(id: MainApp.windowID)
       return false
     }
